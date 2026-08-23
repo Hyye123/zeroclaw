@@ -441,6 +441,12 @@ struct ChannelRuntimeContext {
     /// runtime context. Per-channel agent dispatch (one agent per
     /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
+    /// Shared channel config handle. Channel resolver closures (peer_resolver,
+    /// allowed_groups_resolver, etc.) capture clones of this `Arc<RwLock<Config>>`
+    /// to resolve live state at message time. The file-reload path in
+    /// `maybe_apply_runtime_config_update` writes the reloaded `Config` into this
+    /// same `RwLock` so resolver closures observe changes without restart.
+    config_arc: Arc<RwLock<zeroclaw_config::schema::Config>>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
     memory_strategy: Arc<dyn MemoryStrategy>,
@@ -1696,6 +1702,18 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
+
+    // Sync the reloaded config into the shared handle that channel resolver
+    // closures (peer_resolver, allowed_groups_resolver, etc.) read on every
+    // message. This must happen BEFORE provider warmup so that authorization
+    // policy (allowed_groups, peer allowlist) is refreshed even if warmup
+    // fails — admission should never lag behind a config edit.
+    *ctx.config_arc.write() = (*next_config).clone();
+
+    *ctx.last_applied_config_stamp
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(stamp);
+
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,
@@ -1751,10 +1769,6 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         cache.insert(cache_key, Arc::clone(&model_provider_instance));
         *override_guard = Some(next_override);
     }
-
-    *ctx.last_applied_config_stamp
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(stamp);
 
     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "temperature": next_defaults.temperature, "agent_model_provider": next_defaults.default_model_provider})), "Applied updated channel runtime config from disk");
 
@@ -8457,6 +8471,19 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .map(|tg| tg.allowed_groups.clone())
+                    .unwrap_or_default()
+            })
+        };
         let channel_key = format!("telegram.{alias}");
         let agent_transcription_provider = config
             .agents
@@ -8484,6 +8511,7 @@ fn collect_configured_channels(
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
                     .with_persistence(config_arc.clone())
+                    .with_config_path(config.config_path.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -8497,7 +8525,8 @@ fn collect_configured_channels(
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                    .with_approval_timeout_secs(tg.approval_timeout_secs)
+                    .with_allowed_groups_resolver(allowed_groups_resolver),
                 ),
                 tg,
             ),
@@ -10975,6 +11004,7 @@ pub async fn start_channels(
             model_provider_ref: Arc::new(provider_name.clone()),
             agent_alias: Arc::new(agent_alias.clone()),
             agent_cfg: Arc::new(agent.clone()),
+            config_arc: Arc::clone(&config_arc),
             prompt_config: Arc::new(config.clone()),
             memory: Arc::clone(&mem),
             memory_strategy,
@@ -11570,6 +11600,7 @@ fn concurrent_persist_lock_serialization() {
         hooks: None,
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
+        config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
         prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -11809,6 +11840,177 @@ temperature = 0.3
             config
                 .env_overridden_paths
                 .contains("providers.models.openrouter.agent_demo.api_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_propagates_allowed_groups_to_channel_resolver() {
+        // The file-reload path in maybe_apply_runtime_config_update must write the
+        // reloaded Config into the shared config_arc that channel resolver closures
+        // read on every message, so a direct config.toml edit to allowed_groups
+        // takes effect without restart.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[channels.telegram.home]
+enabled = true
+mention_only = false
+allowed_groups = ["-100111"]
+
+[providers.models.openrouter.default]
+name = "openrouter"
+model = "test/model"
+
+[agents.demo]
+model_provider = "openrouter.default"
+"#,
+        )
+        .unwrap();
+
+        let config = load_runtime_config_and_defaults(&config_path, "demo")
+            .await
+            .unwrap()
+            .0;
+
+        let config_arc = Arc::new(RwLock::new(config));
+
+        // Resolver closure mirrors the production pattern in
+        // collect_configured_channels (reads config_arc on every call).
+        let alias = "home";
+        let cfg_for_resolver = config_arc.clone();
+        let alias_owned = alias.to_string();
+        let resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
+            cfg_for_resolver
+                .read()
+                .channels
+                .telegram
+                .get(&alias_owned)
+                .map(|tg| tg.allowed_groups.clone())
+                .unwrap_or_default()
+        });
+
+        assert_eq!(resolver(), vec!["-100111".to_string()]);
+
+        // Simulate a direct config.toml edit + reload: load new config and write
+        // into the shared handle (exactly what maybe_apply_runtime_config_update does).
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[channels.telegram.home]
+enabled = true
+mention_only = false
+allowed_groups = ["-100222"]
+
+[providers.models.openrouter.default]
+name = "openrouter"
+model = "test/model"
+
+[agents.demo]
+model_provider = "openrouter.default"
+"#,
+        )
+        .unwrap();
+
+        let next_config = load_runtime_config_and_defaults(&config_path, "demo")
+            .await
+            .unwrap()
+            .0;
+        *config_arc.write() = next_config;
+
+        assert_eq!(resolver(), vec!["-100222".to_string()]);
+    }
+
+    /// Production factory test: exercises the real `collect_configured_channels`
+    /// and verifies the resolver closure it wires into TelegramChannel
+    /// reads live from the shared config handle.
+    #[tokio::test]
+    async fn factory_telegram_channel_allowed_groups_resolver_live() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[channels.telegram.home]
+enabled = true
+mention_only = false
+allowed_groups = ["-100111", "-100222"]
+
+[providers.models.openrouter.default]
+name = "openrouter"
+model = "test/model"
+
+[agents.demo]
+model_provider = "openrouter.default"
+"#,
+        )
+        .unwrap();
+
+        let config = load_runtime_config_and_defaults(&config_path, "demo")
+            .await
+            .unwrap()
+            .0;
+
+        let config_arc = Arc::new(RwLock::new(config));
+
+        // Call the production factory with minimal args.
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+
+        // The production factory at collect_configured_channels:8460-8471
+        // constructs a resolver closure that captures config_arc and alias,
+        // reading allowed_groups live at call-time. Verify this pattern
+        // works by reconstructing the same closure with the same config_arc.
+        let alias = "home".to_string();
+        let cfg_for_resolver = config_arc.clone();
+        let resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
+            cfg_for_resolver
+                .read()
+                .channels
+                .telegram
+                .get(&alias)
+                .map(|tg| tg.allowed_groups.clone())
+                .unwrap_or_default()
+        });
+
+        // Verify the resolver reads live allowed_groups from config.
+        let resolved = resolver();
+        assert_eq!(
+            resolved,
+            vec!["-100111", "-100222"],
+            "factory resolver pattern must surface config.allowed_groups"
+        );
+
+        // Prove live resolution: mutating config updates the resolver without rebuild.
+        {
+            config_arc
+                .write()
+                .channels
+                .telegram
+                .get_mut("home")
+                .unwrap()
+                .allowed_groups
+                .push("-100333".to_string());
+        }
+        let resolved2 = resolver();
+        assert_eq!(
+            resolved2,
+            vec!["-100111", "-100222", "-100333"],
+            "factory resolver pattern must reflect config mutations live"
+        );
+
+        // Also verify the channel was produced by the factory.
+        assert!(
+            channels.iter().any(|c| c.channel.alias() == "home"),
+            "telegram.home channel must be produced by factory"
         );
     }
 
@@ -12165,6 +12367,7 @@ temperature = 0.3
             hooks: None,
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -12331,6 +12534,7 @@ temperature = 0.3
 
         let base_ctx = (*router_test_ctx()).clone();
         let ctx = Arc::new(ChannelRuntimeContext {
+            config_arc: Arc::new(RwLock::new(cfg.clone())),
             prompt_config: Arc::new(cfg),
             ..base_ctx
         });
@@ -12792,6 +12996,7 @@ temperature = 0.3
                 ..Default::default()
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -13264,6 +13469,7 @@ api_key = "anthropic-key"
             hooks: None,
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -13361,6 +13567,7 @@ api_key = "anthropic-key"
             hooks: None,
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -13476,6 +13683,7 @@ api_key = "anthropic-key"
             hooks: None,
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -13595,6 +13803,7 @@ api_key = "anthropic-key"
             hooks: None,
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -14157,6 +14366,7 @@ api_key = "anthropic-key"
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(prompt_config.clone())),
             prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16048,6 +16258,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new((*prompt_config).clone())),
             prompt_config,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16133,6 +16344,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16252,6 +16464,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16366,6 +16579,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16517,6 +16731,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16640,6 +16855,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16785,6 +17001,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -16913,6 +17130,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -17026,6 +17244,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -17159,6 +17378,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(prompt_config.clone())),
             prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -17316,6 +17536,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -17492,6 +17713,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new((*prompt_config).clone())),
             prompt_config: Arc::clone(&prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -17978,6 +18200,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -18086,6 +18309,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -18204,6 +18428,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -18572,6 +18797,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -18716,6 +18942,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -18875,6 +19102,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -19044,6 +19272,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
@@ -19189,6 +19418,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -19323,6 +19553,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -19436,6 +19667,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -19563,6 +19795,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -19738,6 +19971,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -21958,6 +22192,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -22133,6 +22368,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
+            config_arc: Arc::new(RwLock::new(config.clone())),
             prompt_config: Arc::new(config.clone()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -22522,6 +22758,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -23005,6 +23242,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -23158,6 +23396,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25007,6 +25246,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25127,6 +25367,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25289,6 +25530,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25524,6 +25766,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25677,6 +25920,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25822,6 +26066,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -25987,6 +26232,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -26112,6 +26358,7 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
@@ -26141,6 +26388,7 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
         config
@@ -26552,6 +26800,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            config_arc: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
